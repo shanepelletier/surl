@@ -180,6 +180,48 @@ class TestMacaroonRefresh(unittest.TestCase):
 
     @patch("surl.requests.request")
     @patch("surl.get_refreshed_discharge")
+    @patch("surl.save_config")
+    @patch("surl.get_authorization_header")
+    def test_store_request_with_refresh_no_headers(
+        self, mock_get_auth_header, mock_save_config, mock_get_refreshed, mock_request
+    ):
+        """Test store_request auto-refresh works even without initial headers."""
+        # First request fails with macaroon-needs-refresh
+        first_response = Mock()
+        first_response.ok = False
+        first_response.text = json.dumps(
+            {"error_list": [{"code": "macaroon-needs-refresh", "message": "Expired"}]}
+        )
+
+        # Second request succeeds
+        second_response = Mock()
+        second_response.ok = True
+        second_response.text = json.dumps({"success": True})
+
+        mock_request.side_effect = [first_response, second_response]
+        mock_get_refreshed.return_value = "new_discharge_macaroon"
+        mock_get_auth_header.return_value = {"Authorization": "refreshed_auth"}
+
+        # Call store_request WITHOUT headers
+        result = surl.store_request(
+            self.test_config, method="GET", url="http://test.url"
+        )
+
+        # Verify refresh was called
+        mock_get_refreshed.assert_called_once_with(self.test_config)
+        # Verify config was saved
+        mock_save_config.assert_called_once()
+        # Verify we got the second (successful) response
+        self.assertEqual(result, second_response)
+        # Verify request was called twice (initial + retry)
+        self.assertEqual(mock_request.call_count, 2)
+        # Verify the second call had headers added
+        second_call_kwargs = mock_request.call_args_list[1][1]
+        self.assertIn("headers", second_call_kwargs)
+        self.assertIn("Authorization", second_call_kwargs["headers"])
+
+    @patch("surl.requests.request")
+    @patch("surl.get_refreshed_discharge")
     def test_store_request_refresh_failure_returns_original_error(
         self, mock_get_refreshed, mock_request
     ):

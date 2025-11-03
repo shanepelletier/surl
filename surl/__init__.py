@@ -489,13 +489,13 @@ def _needs_macaroon_refresh(response_text):
     try:
         data = json.loads(response_text)
         # Check for error_list (Snap Store format)
-        error_list = data.get("error_list", [])
-        for error in error_list:
+        snap_store_errors = data.get("error_list", [])
+        for error in snap_store_errors:
             if error.get("code") == "macaroon-needs-refresh":
                 return True
         # Check for error-list (Charmhub format)
-        error_list = data.get("error-list", [])
-        for error in error_list:
+        charmhub_errors = data.get("error-list", [])
+        for error in charmhub_errors:
             if error.get("code") == "macaroon-needs-refresh":
                 return True
     except (json.JSONDecodeError, AttributeError, KeyError):
@@ -538,16 +538,16 @@ def store_request(config, **kwargs):
                 save_config(new_config)
 
             # Update the Authorization header with the new macaroon
-            if "headers" in kwargs:
-                headers = kwargs["headers"].copy()
-                auth_header = get_authorization_header(new_config.root, new_discharge)
-                headers.update(auth_header)
-                kwargs["headers"] = headers
+            headers = kwargs.get("headers", {}).copy()
+            auth_header = get_authorization_header(new_config.root, new_discharge)
+            headers.update(auth_header)
+            kwargs["headers"] = headers
 
-                # Retry the request with the refreshed macaroon
-                r = requests.request(**kwargs)
-        except Exception:
-            # If refresh fails, return the original error response
+            # Retry the request with the refreshed macaroon
+            r = requests.request(**kwargs)
+        except CliError:
+            # If refresh fails (e.g., no discharge macaroon for Charmhub),
+            # return the original error response
             pass
 
     return r
