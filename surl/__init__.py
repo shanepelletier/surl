@@ -435,8 +435,120 @@ def get_client(web_login, store_env, store_type):
         )
 
 
+def get_refreshed_discharge(config):
+    """Refresh the discharge macaroon using the stored credentials.
+
+    Args:
+        config: ClientConfig containing root and discharge macaroons
+
+    Returns:
+        str: The new discharge macaroon
+
+    Raises:
+        CliError: If refresh fails or credentials are invalid
+    """
+    if config.discharge is None:
+        raise CliError("Cannot refresh: no discharge macaroon found")
+
+    try:
+        # Use the tokens_refresh endpoint to get a new discharge
+        auth_url = CONSTANTS[config.store_env]["sso_base_url"]
+        refresh_endpoint = "/api/v2/tokens/refresh"
+
+        response = requests.post(
+            auth_url + refresh_endpoint,
+            json={"discharge_macaroon": config.discharge},
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": DEFAULT_HEADERS["user-agent"],
+            },
+        )
+
+        if not response.ok:
+            raise CliError(
+                f"Failed to refresh macaroon: "
+                f"HTTP {response.status_code} - {response.text}"
+            )
+
+        new_discharge = response.json()["discharge_macaroon"]
+        return new_discharge
+    except Exception as e:
+        raise CliError(f"Failed to refresh discharge macaroon: {e}")
+
+
+def _needs_macaroon_refresh(response_text):
+    """Check if the API response indicates a macaroon refresh is needed.
+
+    Args:
+        response_text: The response body as a string
+
+    Returns:
+        bool: True if macaroon needs refresh
+    """
+    try:
+        data = json.loads(response_text)
+        # Check for error_list (Snap Store format)
+        snap_store_errors = data.get("error_list", [])
+        for error in snap_store_errors:
+            if error.get("code") == "macaroon-needs-refresh":
+                return True
+        # Check for error-list (Charmhub format)
+        charmhub_errors = data.get("error-list", [])
+        for error in charmhub_errors:
+            if error.get("code") == "macaroon-needs-refresh":
+                return True
+    except (json.JSONDecodeError, AttributeError, KeyError):
+        pass
+    return False
+
+
 def store_request(config, **kwargs):
+    """Make a request to the store with automatic macaroon refresh support.
+
+    This wraps requests.request and automatically refreshes the macaroon
+    if the store returns a "macaroon-needs-refresh" error.
+
+    Args:
+        config: ClientConfig containing credentials
+        **kwargs: Arguments to pass to requests.request
+
+    Returns:
+        requests.Response: The response object
+    """
     r = requests.request(**kwargs)
+
+    # Check if we need to refresh the macaroon
+    if not r.ok and _needs_macaroon_refresh(r.text):
+        try:
+            # Refresh the discharge macaroon
+            new_discharge = get_refreshed_discharge(config)
+
+            # Update the config with the new discharge
+            new_config = ClientConfig(
+                root=config.root,
+                discharge=new_discharge,
+                store_env=config.store_env,
+                store_type=config.store_type,
+                path=config.path,
+            )
+
+            # Save the updated config
+            if config.path:
+                save_config(new_config)
+
+            # Update the Authorization header with the new macaroon
+            headers = kwargs.get("headers", {}).copy()
+            auth_header = get_authorization_header(new_config.root, new_discharge)
+            headers.update(auth_header)
+            kwargs["headers"] = headers
+
+            # Retry the request with the refreshed macaroon
+            r = requests.request(**kwargs)
+        except CliError:
+            # If refresh fails (e.g., no discharge macaroon for Charmhub),
+            # return the original error response
+            pass
 
     return r
 
@@ -491,15 +603,65 @@ def main():
     arguments.extend(remainder)
     arguments.append(url)
 
-    result = subprocess.run(arguments, stderr=subprocess.STDOUT)
+    # Capture output to check for macaroon-needs-refresh
+    result = subprocess.run(arguments, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
-    # Flush STDOUT carefully, because PIPE might be broken.
-    def _noop(*args, **kwargs):
-        pass
+    output = result.stdout
 
+    # Check if we need to refresh the macaroon
+    if result.returncode != 0 and _needs_macaroon_refresh(
+        output.decode("utf-8", errors="ignore")
+    ):
+        try:
+            # Refresh the discharge macaroon
+            new_discharge = get_refreshed_discharge(config)
+
+            # Update the config with the new discharge
+            new_config = ClientConfig(
+                root=config.root,
+                discharge=new_discharge,
+                store_env=config.store_env,
+                store_type=config.store_type,
+                path=config.path,
+            )
+
+            # Save the updated config
+            if config.path:
+                save_config(new_config)
+
+            # Update the Authorization header with the new macaroon
+            new_auth_header = get_authorization_header(new_config.root, new_discharge)
+
+            # Rebuild arguments with updated authorization
+            new_arguments = ["curl", "-sSL", "--output", "-"]
+
+            # Update headers with new auth
+            headers.update(new_auth_header)
+            for header, value in headers.items():
+                new_arguments.append("-H")
+                new_arguments.append(f"{header}: {value}")
+
+            new_arguments.extend(remainder)
+            new_arguments.append(url)
+
+            # Retry the request with the refreshed macaroon
+            result = subprocess.run(
+                new_arguments, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+            )
+            output = result.stdout
+        except CliError:
+            # If refresh fails, use the original error output
+            pass
+
+    # Write output to stdout
     try:
+        sys.stdout.buffer.write(output)
         sys.stdout.buffer.flush()
     except (BrokenPipeError, IOError):
+        # Flush STDOUT carefully, because PIPE might be broken.
+        def _noop(*args, **kwargs):
+            pass
+
         sys.stdout.write = _noop
         sys.stdout.flush = _noop
         return 1
